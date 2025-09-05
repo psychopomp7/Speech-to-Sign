@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# Node (if you have frontend too)
+node_modules/
+dist/
+build/
+
+ASLLVD/
