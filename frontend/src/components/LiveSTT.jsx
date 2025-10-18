@@ -1,157 +1,281 @@
-import { useState, useRef } from "react";
-
-// --- Icons (no changes) ---
-const MicIcon = () => (
-  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" fill="currentColor"/>
-    <path d="M19 10v2a7 7 0 0 1-14 0v-2h2v2a5 5 0 0 0 10 0v-2h2z" fill="currentColor"/>
-    <path d="M12 19.5a.5.5 0 0 1-.5-.5v-2a.5.5 0 0 1 1 0v2a.5.5 0 0 1-.5-.5z" fill="currentColor"/>
-    <path d="M8 22a.5.5 0 0 1-.5-.5v-2a.5.5 0 0 1 1 0v2a.5.5 0 0 1-.5-.5z" fill="currentColor"/>
-    <path d="M16 22a.5.5 0 0 1-.5-.5v-2a.5.5 0 0 1 1 0v2a.5.5 0 0 1-.5-.5z" fill="currentColor"/>
-  </svg>
-);
-const StopIcon = () => (
-  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <rect width="12" height="12" x="6" y="6" fill="currentColor" rx="1"/>
-  </svg>
-);
-const AudioVisualizer = ({ isRecording }) => {
-  const barCount = 32;
-  return (
-    <div className="flex items-center justify-center gap-1 w-full h-12">
-      {Array.from({ length: barCount }).map((_, i) => (
-        <div
-          key={i}
-          className={`w-1 rounded-full bg-cyan-400/50 ${isRecording ? 'animate-visualizer-bar' : 'h-1'}`}
-          style={{
-            animationDelay: isRecording ? `${Math.random() * 0.5}s` : undefined,
-            animationDuration: isRecording ? `${(Math.random() * 0.5) + 1}s` : undefined,
-            height: isRecording ? '100%' : '0.25rem'
-          }}
-        />
-      ))}
-    </div>
-  );
-};
-// --- End Icons ---
-
+import { useState, useRef, useEffect } from "react";
+import { Mic, Send, AlertCircle, CheckCheck, Clock } from "lucide-react";
 
 export default function LiveSTT() {
   const [recording, setRecording] = useState(false);
-  const [transcript, setTranscript] = useState({ final: "", partial: "" });
-  const [statusText, setStatusText] = useState("Click the icon to start recording");
+  const [messages, setMessages] = useState([
+    { id: 0, sender: "system", text: "👋 Welcome! Click the mic button to start chatting.", timestamp: new Date() }
+  ]);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [error, setError] = useState(null);
 
   const wsRef = useRef(null);
   const audioContextRef = useRef(null);
   const workletNodeRef = useRef(null);
   const mediaStreamRef = useRef(null);
+  const chatWindowRef = useRef(null);
+  const messageCountRef = useRef(1);
 
-  const displayText = (transcript.final + " " + transcript.partial).trim();
+  const addMessage = (sender, text) => {
+    if (!text) return;
+    setMessages(prev => [
+      ...prev,
+      { 
+        id: messageCountRef.current++, 
+        sender, 
+        text,
+        timestamp: new Date(),
+        status: sender === "user" ? "sending" : "received"
+      }
+    ]);
+  };
+
+  useEffect(() => {
+    if (chatWindowRef.current) {
+      setTimeout(() => {
+        chatWindowRef.current.scrollTop = chatWindowRef.current.scrollHeight;
+      }, 0);
+    }
+  }, [messages]);
 
   const startRecording = async () => {
-    setTranscript({ final: "", partial: "" });
-    setStatusText("Connecting to server...");
+    setError(null);
+    setIsConnecting(true);
+    addMessage("system", "🎤 Connecting to microphone...");
 
     wsRef.current = new WebSocket("ws://localhost:8000/stt/ws/transcribe");
 
     wsRef.current.onopen = () => {
-      setStatusText("Listening... speak into your microphone");
+      addMessage("system", "✅ Listening... Speak clearly into your microphone");
       setRecording(true);
+      setIsConnecting(false);
     };
 
     wsRef.current.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      console.log("📩 From backend:", data);
+      try {
+        const data = JSON.parse(event.data);
+        console.log("📩 From backend:", data);
+        
+        if (data.final && data.final.trim()) {
+          setMessages(prev => {
+            const updated = [...prev];
+            // Look for the last "Processing" message or create a new user message
+            const lastIdx = updated.length - 1;
+            
+            // Check if the last message is a system message about processing
+            if (lastIdx >= 0 && updated[lastIdx].sender === "system" && updated[lastIdx].text.includes("Processing")) {
+              // Replace it with the transcribed text
+              updated[lastIdx] = {
+                id: messageCountRef.current++,
+                sender: "user",
+                text: data.final,
+                timestamp: new Date(),
+                status: "sent"
+              };
+            } else {
+              // Add as new user message
+              updated.push({
+                id: messageCountRef.current++,
+                sender: "user",
+                text: data.final,
+                timestamp: new Date(),
+                status: "sent"
+              });
+            }
+            return updated;
+          });
+        }
+      } catch (error) {
+        console.error("Error parsing message:", error);
+      }
+    };
 
-      if (data.final) {
-        setTranscript({ final: data.final, partial: "" });
-      }
-      if (data.partial) {
-        setTranscript((prev) => ({ ...prev, partial: data.partial }));
-      }
-    };
-    
     wsRef.current.onclose = () => {
-      setStatusText("Connection closed. Click to start again.");
+      console.log("🔌 WebSocket closed");
       setRecording(false);
+      setIsConnecting(false);
     };
+
     wsRef.current.onerror = () => {
-      setStatusText("Connection error. Please try again.");
+      console.error("WebSocket error");
+      const errorMsg = "❌ Connection error. Please check your backend is running.";
+      addMessage("system", errorMsg);
+      setError(errorMsg);
       setRecording(false);
+      setIsConnecting(false);
     };
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
       audioContextRef.current = new AudioContext({ sampleRate: 16000 });
+      
       await audioContextRef.current.audioWorklet.addModule("/recorder-worklet.js");
       const source = audioContextRef.current.createMediaStreamSource(stream);
       workletNodeRef.current = new AudioWorkletNode(audioContextRef.current, "recorder-processor");
-      
-      // --- THIS IS THE FIX ---
-      // We check the WebSocket state *before* sending.
+
       workletNodeRef.current.port.onmessage = (event) => {
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
+        if (wsRef.current?.readyState === 1) {
           wsRef.current.send(event.data);
         }
       };
-      
+
       source.connect(workletNodeRef.current).connect(audioContextRef.current.destination);
     } catch (error) {
-      console.error("Error starting recording:", error);
-      setStatusText("Microphone access denied. Please allow and try again.");
+      console.error("Error accessing microphone:", error);
+      const errorMsg = "🚫 Microphone access denied. Please allow microphone access and try again.";
+      addMessage("system", errorMsg);
+      setError(errorMsg);
+      setIsConnecting(false);
     }
   };
 
   const stopRecording = () => {
-    setStatusText("Processing final audio...");
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ text: "STOP" }));
-    }
+    addMessage("system", "⏹️ Processing your message...");
     
-    // Gracefully shut down audio components
-    if (workletNodeRef.current) {
+    if (wsRef.current?.readyState === 1) {
+      wsRef.current.send(JSON.stringify({ text: "STOP" }));
+      // Don't close immediately - let the backend send the response first
+      // The connection will close on its own when the backend closes it
+    }
+
+    // Clean up audio resources after a delay to ensure message is sent
+    setTimeout(() => {
+      if (workletNodeRef.current) {
         workletNodeRef.current.port.close();
         workletNodeRef.current.disconnect();
-    }
-    if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-    }
-    if (audioContextRef.current) {
+      }
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      }
+      if (audioContextRef.current) {
         audioContextRef.current.close();
-    }
-    // The wsRef.current.onclose event will handle setting recording to false
+      }
+    }, 500);
+
+    setRecording(false);
+  };
+
+  const getStatusIcon = (status) => {
+    if (status === "sending") return <Clock size={14} className="text-gray-400" />;
+    if (status === "sent") return <CheckCheck size={14} className="text-blue-400" />;
+    return null;
   };
 
   return (
-    <div className="w-full max-w-3xl mx-auto bg-gray-800/30 backdrop-blur-xl border border-cyan-400/20 rounded-2xl shadow-2xl p-8 text-white">
+    <div className="w-full h-full bg-gradient-to-b from-slate-900 to-slate-800 flex flex-col rounded-lg shadow-2xl overflow-hidden">
       
-      {/* Transcript Display Area */}
-      <div className="w-full h-60 bg-black/30 rounded-lg p-6 mb-6 font-mono text-lg leading-relaxed text-gray-200 overflow-y-auto border border-gray-700">
-        {displayText || <span className="text-gray-500">{statusText}</span>}
+      {/* Header */}
+      <div className="bg-gradient-to-r from-emerald-600 to-emerald-700 px-6 py-4 flex items-center justify-between border-b border-emerald-600/50">
+        <div className="flex items-center gap-3">
+          <div className="w-12 h-12 bg-white rounded-full flex items-center justify-center text-emerald-600 font-bold text-lg">
+            A
+          </div>
+          <div>
+            <h2 className="text-base font-semibold text-white">Aura AI</h2>
+            <p className={`text-xs font-medium transition-colors ${
+              recording ? "text-emerald-100 animate-pulse" : "text-emerald-200"
+            }`}>
+              {recording ? "🎤 Recording..." : isConnecting ? "Connecting..." : "Ready to chat"}
+            </p>
+          </div>
+        </div>
+        <div className={`w-3 h-3 rounded-full transition-all ${
+          recording ? "bg-red-400 animate-pulse" : "bg-emerald-300"
+        }`} />
       </div>
 
-      {/* Visualizer */}
-      <AudioVisualizer isRecording={recording} />
+      {/* Messages Window */}
+      <div
+        ref={chatWindowRef}
+        className="flex-1 overflow-y-auto p-4 space-y-3 bg-gradient-to-b from-slate-900 to-slate-800 scrollbar-hide"
+      >
+        {messages.map((msg) => (
+          <div
+            key={msg.id}
+            className={`flex gap-2 animate-fadeIn ${
+              msg.sender === "user" ? "justify-end" : "justify-start"
+            }`}
+          >
+            {msg.sender === "system" && (
+              <div className="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center flex-shrink-0">
+                <AlertCircle size={16} className="text-yellow-400" />
+              </div>
+            )}
+            <div
+              className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg shadow-md text-sm transition-all duration-200 ${
+                msg.sender === "user"
+                  ? "bg-gradient-to-r from-emerald-500 to-emerald-600 text-white rounded-br-none"
+                  : "bg-slate-700 text-gray-100 rounded-bl-none"
+              }`}
+            >
+              <p className="break-words">{msg.text}</p>
+              <div className={`text-xs mt-1 flex items-center gap-1 ${
+                msg.sender === "user" ? "text-emerald-100" : "text-gray-400"
+              }`}>
+                <span>{msg.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                {msg.sender === "user" && getStatusIcon(msg.status)}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
 
-      {/* Controls */}
-      <div className="flex flex-col items-center mt-6">
+      {/* Footer & Input */}
+      <div className="bg-slate-900 px-4 py-3 border-t border-slate-700 flex items-center gap-3">
+        <input
+          type="text"
+          placeholder={recording ? "Listening..." : "Tap mic to speak..."}
+          disabled
+          className="flex-1 bg-slate-800 text-gray-300 rounded-full px-5 py-3 text-sm border border-slate-700 placeholder-gray-500 focus:outline-none focus:border-emerald-500 transition-colors disabled:opacity-60"
+        />
+        
         <button
           onClick={recording ? stopRecording : startRecording}
-          className={`w-24 h-24 rounded-full flex items-center justify-center transition-all duration-300 ease-in-out border-2 border-cyan-400/50
-            ${recording 
-              ? 'bg-red-500/80 text-white animate-pulse-glow' 
-              : 'bg-cyan-500/80 text-white hover:bg-cyan-400'
-            }`
-          }
+          disabled={isConnecting}
+          className={`w-12 h-12 rounded-full flex items-center justify-center transition-all duration-300 font-semibold flex-shrink-0 ${
+            isConnecting
+              ? "bg-gray-600 cursor-not-allowed"
+              : recording
+              ? "bg-red-500 hover:bg-red-600 active:scale-95 shadow-lg shadow-red-500/50"
+              : "bg-emerald-500 hover:bg-emerald-600 active:scale-95 shadow-lg shadow-emerald-500/50"
+          }`}
+          title={recording ? "Stop recording" : "Start recording"}
         >
-          {recording ? <StopIcon /> : <MicIcon />}
+          {isConnecting ? (
+            <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+          ) : recording ? (
+            <div className="w-4 h-4 bg-white rounded-sm" />
+          ) : (
+            <Mic size={20} className="text-white" />
+          )}
         </button>
-        <p className="text-center text-cyan-300/70 h-6 mt-5 tracking-wide">
-          {recording ? "Click to Stop" : statusText}
-        </p>
       </div>
 
+      <style>{`
+        @keyframes fadeIn {
+          from {
+            opacity: 0;
+            transform: translateY(10px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+        
+        .animate-fadeIn {
+          animation: fadeIn 0.3s ease-out;
+        }
+
+        .scrollbar-hide::-webkit-scrollbar {
+          display: none;
+        }
+        .scrollbar-hide {
+          -ms-overflow-style: none;
+          scrollbar-width: none;
+        }
+      `}</style>
     </div>
   );
 }

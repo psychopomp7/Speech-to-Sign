@@ -29,7 +29,6 @@ print("Model initialized.")
 async def transcribe_chunk(audio_chunk: bytes) -> str:
     """
     Transcribes an audio chunk using the faster-whisper model.
-    This runs in a separate thread to avoid blocking the main asyncio event loop.
     """
     audio_float32 = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
     
@@ -50,7 +49,10 @@ async def websocket_transcribe(websocket: WebSocket):
     speech_buffer = bytearray()
     unprocessed_audio = bytearray()
     triggered = False
-    full_transcript = []
+    
+    # --- THIS IS THE FIX ---
+    # We add a flag to prevent two transcriptions from running at once.
+    is_transcribing = False
 
     try:
         while True:
@@ -68,7 +70,6 @@ async def websocket_transcribe(websocket: WebSocket):
                     try:
                         is_speech = vad.is_speech(chunk, RATE)
                     except Exception:
-                        # VAD can fail on silence chunks, just skip it
                         continue
 
                     if is_speech:
@@ -77,38 +78,50 @@ async def websocket_transcribe(websocket: WebSocket):
                     
                     ring_buffer.append((chunk, is_speech))
 
-                    if triggered:
+                    if triggered and not is_transcribing: # <-- Check the flag
                         num_unvoiced = len([f for f, speech in ring_buffer if not speech])
+                        
                         if num_unvoiced == ring_buffer.maxlen:
+                            # --- SET THE FLAG ---
+                            is_transcribing = True 
                             print("Pause detected, transcribing...")
                             
-                            transcription = await transcribe_chunk(bytes(speech_buffer))
-
-                            if transcription:
-                                print(f"📝 Transcription: {transcription}")
-                                full_transcript.append(transcription)
-                                # Send the *entire* transcript so far
-                                await websocket.send_json({"final": " ".join(full_transcript).lower()})
-
-                            # Reset for the next utterance
+                            # Get audio from buffer *before* starting async task
+                            audio_to_transcribe = bytes(speech_buffer)
+                            
+                            # Reset buffers *immediately*
                             triggered = False
                             speech_buffer.clear()
                             ring_buffer.clear()
+                            
+                            transcription = await transcribe_chunk(audio_to_transcribe)
+
+                            if transcription:
+                                print(f"📝 Transcription: {transcription}")
+                                print(f"📤 Sending to frontend: {transcription}")
+                                await websocket.send_json({"final": transcription})
+
+                            # --- CLEAR THE FLAG ---
+                            is_transcribing = False
             
             elif "text" in message:
                 control_data = json.loads(message["text"])
                 if control_data.get("text") == "STOP":
                     print("🛑 STOP message received.")
                     
-                    # --- THIS IS THE CRUCIAL FIX ---
-                    # If there's audio in the buffer, transcribe it one last time.
-                    if speech_buffer:
+                    # --- CHECK THE FLAG ---
+                    # Only transcribe on STOP if a VAD transcription isn't already running
+                    if speech_buffer and not is_transcribing:
                         print("Processing remaining audio buffer...")
                         transcription = await transcribe_chunk(bytes(speech_buffer))
+                        
                         if transcription:
                             print(f"📝 Final (STOP) Transcription: {transcription}")
-                            full_transcript.append(transcription)
-                            await websocket.send_json({"final": " ".join(full_transcript).lower()})
+                            print(f"📤 Sending final to frontend: {transcription}")
+                            try:
+                                await websocket.send_json({"final": transcription})
+                            except Exception as e:
+                                print(f"❌ Failed to send: {e}")
                     
                     break # Exit the loop to close the connection
 
