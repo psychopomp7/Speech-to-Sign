@@ -10,8 +10,8 @@ router = APIRouter()
 
 # --- Configuration ---
 MODEL_SIZE = "medium.en"
-DEVICE = "cpu"
-COMPUTE_TYPE = "int8"
+DEVICE = "cuda"
+COMPUTE_TYPE = "float16"
 
 # VAD Configurations
 VAD_AGGRESSIVENESS = 1      # How aggressive VAD is (0-3). 1 is less aggressive.

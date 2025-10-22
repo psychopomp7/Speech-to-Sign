@@ -21,3 +21,6 @@ dist/
 build/
 
 ASLLVD/
+backend/pose_dictionary.json
+backend/train.csv
+backend/models
