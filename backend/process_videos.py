@@ -4,135 +4,217 @@ import numpy as np
 import os
 import json
 import pandas as pd
+import sqlite3 # Import SQLite
+import sys
+import time # For timing
 
 # --- Configuration ---
-# Get the directory where this script is located (i.e., the 'backend' folder)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# 1. Point this to the root directory of your ASLLVD video files
-ASLLVD_ROOT_DIR = r"D:\Speech to Sign\ASLLVD" # <-- This path stays the same
-
-# 2. This is the metadata file.
+ASLLVD_ROOT_DIR = r"C:\Mridul Project\Speech-to-Sign\ASLLVD" # <-- Your video folder path
 METADATA_FILENAME = "asllvd_signs_2024_06_27.csv"
 METADATA_FILE = os.path.join(SCRIPT_DIR, METADATA_FILENAME)
-
-# 3. This is where the final dictionary will be saved
-OUTPUT_JSON = os.path.join(SCRIPT_DIR, "pose_dictionary.json")
+# --- NEW: Database Configuration ---
+DB_FILENAME = "pose_dictionary.db"
+DB_PATH = os.path.join(SCRIPT_DIR, DB_FILENAME)
 
 # --- MediaPipe Initialization ---
 mp_holistic = mp.solutions.holistic
 holistic = mp_holistic.Holistic(
-    static_image_mode=False, 
-    model_complexity=2,
+    static_image_mode=False,
+    model_complexity=1,
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 )
 
 def extract_keypoints(results):
-    """
-    Extracts keypoints from MediaPipe results into a flat array.
-    """
     pose_flat = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark]).flatten() if results.pose_landmarks else np.zeros(33*3)
     lh_flat = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() if results.left_hand_landmarks else np.zeros(21*3)
     rh_flat = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(21*3)
+    # Convert numpy array to list for JSON serialization later
     return np.concatenate([pose_flat, lh_flat, rh_flat]).tolist()
 
-# --- MODIFIED FUNCTION ---
-def process_videos(dataset_path, metadata_path, output_json_path):
-    
-    # --- 1. LOAD EXISTING DICTIONARY (THE CRUCIAL CHANGE) ---
-    if os.path.exists(output_json_path):
-        print(f"Loading existing dictionary from {output_json_path}...")
-        try:
-            with open(output_json_path, 'r') as f:
-                pose_dictionary = json.load(f)
-            print(f"Loaded {len(pose_dictionary)} existing sign poses.")
-        except json.JSONDecodeError:
-            print("Warning: pose_dictionary.json is corrupted. Starting fresh.")
-            pose_dictionary = {}
-    else:
-        print("No existing dictionary found. Starting fresh.")
-        pose_dictionary = {}
-    # --- END OF CHANGE ---
+# --- Database Functions ---
+def setup_database(db_path):
+    """Creates the database and table if they don't exist."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS poses (
+            gloss TEXT PRIMARY KEY,
+            pose_data TEXT NOT NULL
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    print(f"Database setup complete at {db_path}")
 
-    # --- 2. Load metadata ---
+def get_existing_glosses(db_path):
+    """Gets a set of glosses already present in the database."""
+    existing_glosses = set()
+    if not os.path.exists(db_path):
+        return existing_glosses
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT gloss FROM poses")
+        rows = cursor.fetchall()
+        existing_glosses = {row[0] for row in rows}
+        conn.close()
+    except Exception as e:
+        print(f"Warning: Could not read existing glosses from database. Error: {e}")
+    return existing_glosses
+
+def insert_pose_data(db_path, gloss, pose_data):
+    """Inserts or replaces pose data for a given gloss."""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    # Serialize pose_data list into a JSON string for storage
+    pose_data_json = json.dumps(pose_data)
+    # Use INSERT OR REPLACE to handle potential duplicates cleanly
+    cursor.execute("INSERT OR REPLACE INTO poses (gloss, pose_data) VALUES (?, ?)",
+                   (gloss, pose_data_json))
+    conn.commit()
+    conn.close()
+
+# --- MODIFIED Main Processing Function ---
+def process_videos_grouped(dataset_path, metadata_path, db_path):
+
+    # --- 1. Setup DB and get existing glosses ---
+    setup_database(db_path)
+    existing_glosses = get_existing_glosses(db_path)
+    print(f"Found {len(existing_glosses)} existing signs in the database.")
+
+    # --- 2. Load and Group Metadata ---
     try:
         df = pd.read_csv(metadata_path)
-        df_unique = df[["full video file", "Class Label"]].drop_duplicates()
-        metadata = pd.Series(df_unique["Class Label"].values, index=df_unique["full video file"]).to_dict()
+        df.rename(columns={
+            'full video file': 'video_filename',
+            'Class Label': 'gloss_label',
+            'start frame of the sign (relative to full videos)': 'start_frame',
+            'end frame of the sign (relative to full videos)': 'end_frame'
+        }, inplace=True)
+
+        # Keep only necessary columns and drop rows with missing values
+        df_filtered = df[['video_filename', 'gloss_label', 'start_frame', 'end_frame']].dropna()
+
+        # Clean gloss labels
+        df_filtered['gloss_label'] = df_filtered['gloss_label'].astype(str).str.upper().str.split('(', expand=True)[0].str.strip()
+
+        # Convert frame numbers to integers, drop invalid rows
+        df_filtered = df_filtered[pd.to_numeric(df_filtered['start_frame'], errors='coerce').notnull()]
+        df_filtered = df_filtered[pd.to_numeric(df_filtered['end_frame'], errors='coerce').notnull()]
+        df_filtered['start_frame'] = df_filtered['start_frame'].astype(int)
+        df_filtered['end_frame'] = df_filtered['end_frame'].astype(int)
+
+        # Filter out invalid frame ranges
+        df_filtered = df_filtered[df_filtered['end_frame'] > df_filtered['start_frame']]
+        df_filtered = df_filtered[df_filtered['start_frame'] >= 0]
+
+
+        # **GROUPING**: Group rows by video filename
+        grouped_metadata = df_filtered.groupby('video_filename')
+
+        print(f"Loaded and grouped metadata. Processing {len(grouped_metadata)} unique videos.")
+
     except Exception as e:
-        print(f"Error: Could not load metadata file from {metadata_path}")
-        return
+        print(f"Error: Could not load or process metadata file from {metadata_path}")
+        print(f"Details: {e}")
+        sys.exit("Exiting due to metadata error.")
 
-    print(f"Loaded metadata. Found {len(metadata)} unique video files in master list.")
-    
-    video_files = list(metadata.keys())
-    new_signs_found_this_session = 0
-    
-    for i, video_filename in enumerate(video_files):
-        gloss_label = str(metadata[video_filename]).upper().split('(')[0].strip()
+    processed_signs_total = len(existing_glosses)
+    processed_this_session = 0
+    start_time = time.time()
 
-        # --- 3. CHECK IF WE ALREADY HAVE THIS SIGN ---
-        # If this gloss is *already* in our JSON, we can skip it.
-        # This speeds up processing hugely.
-        if gloss_label in pose_dictionary:
-            continue
-            
+    # --- 3. Iterate through Videos ---
+    for video_filename, group in grouped_metadata:
         video_path = os.path.join(dataset_path, video_filename)
-        
-        # --- 4. CHECK IF WE HAVE THE VIDEO FILE ---
-        # If the file doesn't exist (because it's deleted or not downloaded),
-        # skip it.
+
         if not os.path.exists(video_path):
-            # This is no longer a "Warning", just a normal skip.
-            # We can comment this out to reduce log spam:
-            # print(f"File not found (normal): {video_path}. Skipping.")
+            # print(f"Skipping video (not found): {video_path}")
+            continue # Skip if the whole video file is missing
+
+        # Check if ALL signs in this video group are already processed
+        signs_in_group = set(group['gloss_label'])
+        if signs_in_group.issubset(existing_glosses):
+            # print(f"Skipping video (all signs processed): {video_filename}")
             continue
-            
-        # --- 5. PROCESS THE NEW VIDEO ---
+
+        # --- Open Video ONCE ---
         cap = cv2.VideoCapture(video_path)
-        frame_keypoints = []
-        
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
+        if not cap.isOpened():
+            print(f"Warning: Could not open video file {video_path}. Skipping group.")
+            continue
+
+        print(f"\nProcessing video: {video_filename} ({len(group)} sign instances)")
+
+        # --- Iterate through Sign Segments within this Video ---
+        # Sort group by start_frame to process segments mostly sequentially
+        group_sorted = group.sort_values('start_frame')
+
+        for index, row in group_sorted.iterrows():
+            gloss_label = row['gloss_label']
+            start_frame = row['start_frame']
+            end_frame = row['end_frame']
+
+            # Skip if this specific gloss is already done
+            if gloss_label in existing_glosses:
+                continue
+
+            frame_keypoints = []
+            success_reading = True
             try:
-                image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                image.flags.writeable = False
-                results = holistic.process(image)
-                keypoints = extract_keypoints(results)
-                frame_keypoints.append(keypoints)
+                # --- Seek and Read Segment ---
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                current_frame = start_frame
+
+                while current_frame <= end_frame:
+                    ret, frame = cap.read()
+                    if not ret:
+                        print(f"  Warning: Failed to read frame {current_frame} for {gloss_label}. Stopping segment.")
+                        success_reading = False
+                        break
+
+                    image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    image.flags.writeable = False
+                    results = holistic.process(image)
+                    keypoints = extract_keypoints(results)
+                    frame_keypoints.append(keypoints)
+                    current_frame += 1
+
+                # --- Store Result in DB ---
+                if frame_keypoints and success_reading:
+                     insert_pose_data(db_path, gloss_label, frame_keypoints)
+                     existing_glosses.add(gloss_label) # Update set to avoid reprocessing
+                     processed_signs_total += 1
+                     processed_this_session += 1
+                     print(f"  -> Added Gloss: {gloss_label} [{start_frame}-{end_frame}] ({len(frame_keypoints)} frames). Total: {processed_signs_total}")
+
+                     # Optional: Periodic commit (less frequent needed with SQLite)
+                     # if processed_this_session % 100 == 0: ...
+
+                elif not success_reading:
+                    print(f"  Skipping storage for {gloss_label} due to frame reading errors.")
+
             except Exception as e:
-                print(f"Error processing frame in {video_filename}: {e}. Skipping video.")
-                frame_keypoints = [] # Clear any partial data
-                break # Stop processing this video
-            
+                print(f"  ERROR processing segment for {gloss_label} [{start_frame}-{end_frame}]: {e}. Skipping.")
+                # Continue to the next segment in the video
+
+        # --- Close Video ---
         cap.release()
-        
-        if frame_keypoints:
-            pose_dictionary[gloss_label] = frame_keypoints
-            new_signs_found_this_session += 1
-            print(f"Processed ({i+1}/{len(video_files)}): {video_filename} -> ADDED NEW Gloss: {gloss_label} ({len(frame_keypoints)} frames)")
 
-    print(f"\nFound {new_signs_found_this_session} new signs in this session.")
-    return pose_dictionary
+    end_time = time.time()
+    print(f"\nFinished processing all videos.")
+    print(f" - New signs added this session: {processed_this_session}")
+    print(f" - Total signs in database: {processed_signs_total}")
+    print(f" - Total time: {end_time - start_time:.2f} seconds")
+    return processed_signs_total # Return total count
 
-# --- Main execution (MODIFIED) ---
+# --- Main execution ---
 if __name__ == "__main__":
-    print("Starting incremental video processing...")
-    
-    # We now pass OUTPUT_JSON as an argument so the function can read it
-    final_poses = process_videos(ASLLVD_ROOT_DIR, METADATA_FILE, OUTPUT_JSON)
-    
-    if final_poses:
-        print(f"\nProcessing complete. Total signs in dictionary: {len(final_poses)}")
-        
-        # Save the dictionary to JSON
-        with open(OUTPUT_JSON, 'w') as f:
-            json.dump(final_poses, f) # Save without indent for smaller file size
-            
-        print(f"✅ Successfully updated pose dictionary: {OUTPUT_JSON}")
+    print("Starting grouped video processing with SQLite...")
+    total_signs = process_videos_grouped(ASLLVD_ROOT_DIR, METADATA_FILE, DB_PATH)
+
+    if total_signs is not None:
+        print(f"\n✅ Processing complete. Database '{DB_FILENAME}' contains {total_signs} signs.")
     else:
-        print("No poses were processed. Please check your paths and metadata.")
+        print("\n❌ Processing failed due to errors.")
